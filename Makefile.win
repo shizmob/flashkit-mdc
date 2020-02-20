@@ -1,0 +1,2 @@
+include Makefile
+CFLAGS += -D__USE_MINGW_ANSI_STDIO=1 -Wl,--start-group -lws2_32

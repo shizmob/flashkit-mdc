@@ -28,35 +28,118 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <assert.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <arpa/inet.h> // hton
-#include <termios.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winsock.h> // ntohs
+#define FD_TYPE      HANDLE
+#define FD_INVALID   INVALID_HANDLE_VALUE
+#define DEFAULT_PORT "COM1"
+#else
 #include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <sys/types.h>
+#include <arpa/inet.h> // ntohs
+#define FD_TYPE      int
+#define FD_INVALID   -1
+#define DEFAULT_PORT "/dev/ttyusb0"
+#endif
 
 #ifndef min
 #define min(x, y) ((x) < (y) ? (x) : (y))
 #define max(x, y) ((x) > (y) ? (x) : (y))
 #endif
 
-enum dev_cmd {
-	CMD_ADDR = 0,
-        CMD_LEN = 1,
-        CMD_RD = 2,
-        CMD_WR = 3,
-        CMD_RY = 4,
-        CMD_DELAY = 5,
-};
-#define PAR_MODE8  (1 << 4)
-#define PAR_DEV_ID (1 << 5)
-#define PAR_SINGE  (1 << 6)
-#define PAR_INC    (1 << 7)
+#ifdef _WIN32
+static HANDLE setup(const char *port)
+{
+	DCB params;
+	HANDLE fd;
 
-static int setup(int fd)
+	fd = CreateFileA(port, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	if (fd == INVALID_HANDLE_VALUE)
+	{
+		return FD_INVALID;
+	}
+
+	memset(&params, 0, sizeof(params));
+	params.DCBlength = sizeof(params);
+	if (!GetCommState(fd, &params))
+	{
+		return FD_INVALID;
+	}
+
+	params.BaudRate = CBR_9600;
+	params.ByteSize = 8;
+	params.StopBits = ONESTOPBIT;
+	params.Parity   = NOPARITY;
+
+	params.fOutxCtsFlow    = params.fOutxDsrFlow = FALSE;
+	params.fDsrSensitivity = FALSE;
+	params.fDtrControl     = DTR_CONTROL_DISABLE;
+	params.fRtsControl     = RTS_CONTROL_DISABLE;
+
+	params.fOutX = params.fInX = FALSE;
+	params.fNull = FALSE;
+
+	if (!SetCommState(fd, &params))
+	{
+		return FD_INVALID;
+	}
+
+	return fd;
+}
+
+static int write_serial(HANDLE fd, const void *data, size_t size)
+{
+	unsigned long ret;
+
+	if (!WriteFile(fd, data, size, &ret, NULL) || ret != size) {
+		fprintf(stderr, "write %lu/%zu: ", ret, size);
+		perror("");
+		exit(1);
+	}
+
+	return 0;
+}
+
+static int read_serial(HANDLE fd, void *data, size_t size)
+{
+	size_t got = 0;
+	unsigned long ret;
+
+	while (got < size) {
+		if (!ReadFile(fd, (char *)data + got, size - got, &ret, NULL)) {
+			fprintf(stderr, "read %lu %zu/%zu: ",
+				ret, got, size);
+			perror("");
+			exit(1);
+		}
+		got += ret;
+	}
+
+	return 0;
+}
+
+static int close_serial(HANDLE fd)
+{
+	return CloseHandle(fd);
+}
+#else
+static int setup(const char *port)
 {
 	struct termios tty;
 	int ret;
+	int fd;
+
+	fd = open(port, O_RDWR | O_NOCTTY | O_SYNC);
+	if (fd < 0)
+	{
+		perror("open");
+		return -1;
+	}
 
 	memset(&tty, 0, sizeof(tty));
 
@@ -64,7 +147,7 @@ static int setup(int fd)
 	if (ret != 0)
 	{
 		perror("tcgetattr");
-		return 1;
+		return -1;
 	}
 
 	tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP
@@ -80,10 +163,10 @@ static int setup(int fd)
 	ret = tcsetattr(fd, TCSANOW, &tty);
 	if (ret != 0) {
 		perror("tcsetattr");
-		return ret;
+		return -1;
 	}
 
-	return 0;
+	return fd;
 }
 
 static int write_serial(int fd, const void *data, size_t size)
@@ -119,7 +202,27 @@ static int read_serial(int fd, void *data, size_t size)
 	return 0;
 }
 
-static void set_addr(int fd, uint32_t addr)
+static int close_serial(int fd)
+{
+	return close(fd) == 0;
+}
+#endif // !_WIN32
+
+
+enum dev_cmd {
+	CMD_ADDR = 0,
+        CMD_LEN = 1,
+        CMD_RD = 2,
+        CMD_WR = 3,
+        CMD_RY = 4,
+        CMD_DELAY = 5,
+};
+#define PAR_MODE8  (1 << 4)
+#define PAR_DEV_ID (1 << 5)
+#define PAR_SINGE  (1 << 6)
+#define PAR_INC    (1 << 7)
+
+static void set_addr(FD_TYPE fd, uint32_t addr)
 {
 	uint8_t cmd[6] = {
 		CMD_ADDR, addr >> 17,
@@ -129,7 +232,7 @@ static void set_addr(int fd, uint32_t addr)
 	write_serial(fd, cmd, sizeof(cmd));
 }
 
-static uint16_t read_word(int fd, uint32_t addr)
+static uint16_t read_word(FD_TYPE fd, uint32_t addr)
 {
 	uint8_t cmd[7] = {
 		CMD_ADDR, addr >> 17,
@@ -144,7 +247,7 @@ static uint16_t read_word(int fd, uint32_t addr)
 	return ntohs(r);
 }
 
-static void write_word(int fd, uint32_t addr, uint16_t d)
+static void write_word(FD_TYPE fd, uint32_t addr, uint16_t d)
 {
 	uint8_t cmd[9] = {
 		CMD_ADDR, addr >> 17,
@@ -157,7 +260,7 @@ static void write_word(int fd, uint32_t addr, uint16_t d)
 	write_serial(fd, cmd, sizeof(cmd));
 }
 
-static void read_block(int fd, void *dst, uint32_t size)
+static void read_block(FD_TYPE fd, void *dst, uint32_t size)
 {
 	uint8_t cmd[5] = {
 		CMD_LEN, size >> 9,
@@ -170,7 +273,7 @@ static void read_block(int fd, void *dst, uint32_t size)
 	read_serial(fd, dst, size);
 }
 
-static uint16_t flash_seq_r(int fd, uint8_t cmd, uint32_t addr)
+static uint16_t flash_seq_r(FD_TYPE fd, uint8_t cmd, uint32_t addr)
 {
 	// unlock
 	write_word(fd, 0xaaa, 0xaa);
@@ -180,7 +283,7 @@ static uint16_t flash_seq_r(int fd, uint8_t cmd, uint32_t addr)
 	return read_word(fd, addr);
 }
 
-static void flash_seq_erase(int fd, uint32_t addr)
+static void flash_seq_erase(FD_TYPE fd, uint32_t addr)
 {
 	// printf("erase %06x\n", addr);
 	write_word(fd, 0xaaa, 0xaa);
@@ -192,7 +295,7 @@ static void flash_seq_erase(int fd, uint32_t addr)
 	write_word(fd, addr, 0x30);
 }
 
-static void flash_seq_write(int fd, uint32_t addr, uint8_t *d)
+static void flash_seq_write(FD_TYPE fd, uint32_t addr, uint8_t *d)
 {
 	uint8_t cmd[] = {
 		// unlock
@@ -221,7 +324,7 @@ static void flash_seq_write(int fd, uint32_t addr, uint8_t *d)
 }
 
 // status wait + dummy read to cause a wait?
-static uint16_t ry_read(int fd)
+static uint16_t ry_read(FD_TYPE fd)
 {
 	uint8_t cmd[2] = { CMD_RY, CMD_RD | PAR_SINGE };
 	uint16_t rv = 0;
@@ -231,7 +334,7 @@ static uint16_t ry_read(int fd)
 	return ntohs(rv);
 }
 
-static void set_delay(int fd, uint8_t delay)
+static void set_delay(FD_TYPE fd, uint8_t delay)
 {
 	uint8_t cmd[2] = { CMD_DELAY, delay };
 
@@ -251,7 +354,7 @@ static struct flash_info {
 	} region[4];
 } info;
 
-static void read_info(int fd)
+static void read_info(FD_TYPE fd)
 {
 	static const uint16_t qry[3] = { 'Q', 'R', 'Y' };
 	uint32_t total = 0;
@@ -346,7 +449,7 @@ static void usage(const char *argv0)
 {
 	printf("usage:\n"
 		"%s [options]\n"
-		"  -d <ttydevice>      (default /dev/ttyUSB0)\n"
+		"  -d <ttydevice>      (default " DEFAULT_PORT ")\n"
 		"  -r <file> [size]    dump the cart (default 4MB)\n"
 		"  -w <file> [size]    flash the cart (file size)\n"
 		"  -e <size>           erase (rounds to block size)\n"
@@ -378,7 +481,7 @@ static uint8_t g_block2[0x10000];
 
 int main(int argc, char *argv[])
 {
-	const char *portname = "/dev/ttyUSB0";
+	const char *portname = DEFAULT_PORT;
 	const char *fname_w = NULL;
 	const char *fname_r = NULL;
 	long size_w = 0;
@@ -395,7 +498,7 @@ int main(int argc, char *argv[])
 	uint8_t cmd;
 	uint16_t rv;
 	int arg = 1;
-	int fd;
+	FD_TYPE fd;
 
 	if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))
 		usage(argv[0]);
@@ -472,14 +575,12 @@ int main(int argc, char *argv[])
 			size_v = size_w;
 	}
 
-	fd = open(portname, O_RDWR | O_NOCTTY | O_SYNC);
-	if (fd < 0) {
+	fd = setup(portname);
+	if (fd == FD_INVALID) {
 		fprintf(stderr, "open %s: ", portname);
 		perror("");
 		return 1;
 	}
-
-	setup(fd);
 
 	cmd = CMD_RD | PAR_SINGE | PAR_DEV_ID;
 	write_serial(fd, &cmd, sizeof(cmd));
@@ -591,6 +692,7 @@ int main(int argc, char *argv[])
 		fclose(f_r);
 	if (f_w)
 		fclose(f_w);
+	close_serial(fd);
 
 	return 0;
 }
